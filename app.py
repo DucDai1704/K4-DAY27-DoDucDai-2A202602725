@@ -53,6 +53,26 @@ async def get_recent_sessions() -> list[dict]:
         return []
 
 
+async def load_session_state(thread_id: str):
+    """Load latest state and check for interrupts from checkpointer."""
+    try:
+        async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
+            await cp.setup()
+            app = build_graph(cp)
+            cfg = {"configurable": {"thread_id": thread_id}}
+            state = await app.aget_state(cfg)
+            int_payload = None
+            if state and state.tasks:
+                for t in state.tasks:
+                    if t.interrupts:
+                        int_payload = t.interrupts[0].value
+                        break
+            values = state.values if state and state.values else None
+            return values, int_payload
+    except Exception:
+        return None, None
+
+
 # ─── Session state ─────────────────────────────────────────────────────────
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
@@ -96,6 +116,11 @@ with st.sidebar:
                     st.session_state.pr_url = s["pr_url"]
                     st.session_state.interrupt_payload = None
                     st.session_state.final = None
+                    values, int_payload = asyncio.run(load_session_state(tid))
+                    if int_payload is not None:
+                        st.session_state.interrupt_payload = int_payload
+                    elif values is not None:
+                        st.session_state.final = values
                     st.rerun()
     else:
         st.info("No recorded sessions yet. Run a review to populate the audit log!")

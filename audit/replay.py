@@ -43,7 +43,8 @@ async def list_threads() -> None:
             rows = await cur.fetchall()
 
     table = Table(title="Recent review sessions")
-    for col in ("thread_id", "pr_url", "started", "last_event", "worst_risk", "events"):
+    table.add_column("thread_id", no_wrap=True)
+    for col in ("pr_url", "started", "last_event", "worst_risk", "events"):
         table.add_column(col)
     for r in rows:
         table.add_row(
@@ -60,6 +61,21 @@ async def list_threads() -> None:
 async def replay(thread_id: str) -> None:
     console = Console()
     events = await replay_events(thread_id)
+    if not events:
+        # Fallback to search by prefix if user copied truncated or short thread_id
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT id, timestamp, agent_id, action, confidence, risk_level,
+                       reviewer_id, decision, reason, execution_time_ms
+                  FROM audit_events
+                 WHERE thread_id LIKE ?
+                 ORDER BY id
+                """,
+                (f"{thread_id}%",),
+            ) as cur:
+                rows = await cur.fetchall()
+                events = [dict(r) for r in rows]
 
     if not events:
         console.print(f"[red]No events found for thread {thread_id}[/red]")

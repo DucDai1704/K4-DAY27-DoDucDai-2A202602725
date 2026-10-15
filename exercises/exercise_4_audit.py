@@ -38,7 +38,7 @@ from langgraph.types import Command, interrupt
 from rich.console import Console
 from rich.panel import Panel
 
-from common.db import db_path, write_audit_event
+from common.db import db_conn, db_path, write_audit_event
 from common.github import fetch_pr, post_review_comment
 from common.llm import get_llm
 from common.schemas import (
@@ -53,6 +53,19 @@ from common.schemas import (
 
 console = Console()
 AGENT_ID = "pr-review-agent@v0.1"
+
+
+async def _is_already_audited(thread_id: str, action: str, decision: str) -> bool:
+    """Avoid duplicate logs when LangGraph re-runs the node on resume."""
+    try:
+        async with db_conn() as conn:
+            async with conn.execute(
+                "SELECT 1 FROM audit_events WHERE thread_id = ? AND action = ? AND decision = ? LIMIT 1",
+                (thread_id, action, decision),
+            ) as cur:
+                return await cur.fetchone() is not None
+    except Exception:
+        return False
 
 
 async def audit(state, entry: AuditEntry) -> None:
@@ -153,15 +166,16 @@ async def node_human_approval(state):
     t0 = time.monotonic()
     a = state["analysis"]
 
-    await audit(state, AuditEntry(
-        agent_id=AGENT_ID,
-        action="human_approval",
-        confidence=a.confidence,
-        risk_level=risk_level_for(a.confidence),
-        decision="pending",
-        reason="Awaiting human approval",
-        execution_time_ms=int((time.monotonic() - t0) * 1000),
-    ))
+    if not await _is_already_audited(state["thread_id"], "human_approval", "pending"):
+        await audit(state, AuditEntry(
+            agent_id=AGENT_ID,
+            action="human_approval",
+            confidence=a.confidence,
+            risk_level=risk_level_for(a.confidence),
+            decision="pending",
+            reason="Awaiting human approval",
+            execution_time_ms=int((time.monotonic() - t0) * 1000),
+        ))
 
     resp = interrupt({
         "kind": "approval_request",
@@ -216,16 +230,27 @@ def _post(state) -> str:
 async def node_commit(state):
     console.print("[cyan]→ commit[/cyan]")
     t0 = time.monotonic()
-    # Two paths converge here:
-    #   1. human_approval → commit (only post if approved)
-    #   2. escalate → synthesize → commit (always post the refined review)
-    if state.get("escalation_answers") or state.get("human_choice") == "approve":
+    choice = state.get("human_choice")
+    if choice == "edit":
+        fb = state.get("human_feedback") or "Reviewer requested refinements to review comments."
+        console.print(f"  [yellow]·[/yellow] auto-refining review based on reviewer feedback: {fb}")
+        llm = get_llm().with_structured_output(PRAnalysis)
+        refined: PRAnalysis = await llm.ainvoke([
+            {"role": "system", "content": "Senior reviewer. Incorporate reviewer feedback into comments and summary. Re-evaluate confidence."},
+            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}\n\nReviewer Feedback:\n{fb}"},
+        ])
+        state["analysis"] = refined
         action = _post(state)
+        decision = "edit"
+    elif state.get("escalation_answers") or choice == "approve":
+        action = _post(state)
+        decision = "approve" if action == "committed" else action
     else:
-        console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
+        console.print(f"  [yellow]·[/yellow] skipping comment (choice={choice})")
         action = "rejected"
+        decision = "reject"
+
     a = state["analysis"]
-    decision = "approve" if action == "committed" else ("reject" if action == "rejected" else action)
     await audit(state, AuditEntry(
         agent_id=AGENT_ID,
         action="commit",
@@ -233,7 +258,7 @@ async def node_commit(state):
         risk_level=risk_level_for(a.confidence),
         reviewer_id=os.environ.get("GITHUB_USER"),
         decision=decision,
-        reason=f"Action: {action}",
+        reason=state.get("human_feedback") or f"Action: {action}",
         execution_time_ms=int((time.monotonic() - t0) * 1000),
     ))
     return {"final_action": action}
@@ -261,15 +286,16 @@ async def node_escalate(state):
     a = state["analysis"]
     questions = a.escalation_questions or ["What is the intent of this PR?"]
 
-    await audit(state, AuditEntry(
-        agent_id=AGENT_ID,
-        action="escalate",
-        confidence=a.confidence,
-        risk_level=risk_level_for(a.confidence),
-        decision="escalate",
-        reason=f"Escalated with {len(questions)} question(s) for human reviewer",
-        execution_time_ms=int((time.monotonic() - t0) * 1000),
-    ))
+    if not await _is_already_audited(state["thread_id"], "escalate", "escalate"):
+        await audit(state, AuditEntry(
+            agent_id=AGENT_ID,
+            action="escalate",
+            confidence=a.confidence,
+            risk_level=risk_level_for(a.confidence),
+            decision="escalate",
+            reason=f"Escalated with {len(questions)} question(s) for human reviewer",
+            execution_time_ms=int((time.monotonic() - t0) * 1000),
+        ))
 
     answers = interrupt({
         "kind": "escalation",

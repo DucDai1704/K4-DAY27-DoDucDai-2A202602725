@@ -137,13 +137,23 @@ def _post(state, label: str) -> str:
 def node_commit(state):
     console.print("[cyan]→ commit[/cyan]")
     # Two paths converge here:
-    #   1. human_approval → commit (only post if approved)
+    #   1. human_approval → commit (only post if approved or edited)
     #   2. escalate → synthesize → commit (always post the refined review)
+    choice = state.get("human_choice")
+    if choice == "edit":
+        fb = state.get("human_feedback") or "Reviewer requested refinements."
+        llm = get_llm().with_structured_output(PRAnalysis)
+        refined = llm.invoke([
+            {"role": "system", "content": "Senior reviewer. Incorporate reviewer feedback into comments and summary."},
+            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}\n\nFeedback:\n{fb}"},
+        ])
+        state["analysis"] = refined
+        return {"final_action": _post(state, "committed_after_edit")}
     if state.get("escalation_answers"):
         return {"final_action": _post(state, "committed_after_escalation")}
-    if state.get("human_choice") == "approve":
+    if choice == "approve":
         return {"final_action": _post(state, "committed")}
-    console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
+    console.print(f"  [yellow]·[/yellow] skipping comment (choice={choice})")
     return {"final_action": "rejected"}
 
 
