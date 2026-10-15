@@ -22,15 +22,35 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
-
+from common.db import db_conn, db_path
+from exercises.exercise_4_audit import build_graph
 
 load_dotenv()
+
+
+# ─── Database helper for recent sessions ──────────────────────────────────
+async def get_recent_sessions() -> list[dict]:
+    """Fetch recent review sessions from audit_events for the sidebar."""
+    try:
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT thread_id,
+                       pr_url,
+                       MIN(timestamp)        AS started,
+                       MAX(timestamp)        AS last_event,
+                       MAX(risk_level)       AS worst_risk,
+                       COUNT(*)              AS events
+                  FROM audit_events
+                 GROUP BY thread_id, pr_url
+                 ORDER BY MAX(timestamp) DESC
+                 LIMIT 15
+                """
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 # ─── Session state ─────────────────────────────────────────────────────────
@@ -44,73 +64,133 @@ if "final" not in st.session_state:
     st.session_state.final = None
 
 
-# ─── Page setup ────────────────────────────────────────────────────────────
-st.set_page_config(page_title="HITL PR Review", layout="wide")
-st.title("HITL PR Review Agent")
+# ─── Page setup ────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="HITL PR Review Agent",
+    page_icon="🤖",
+    layout="wide",
+)
+
+st.title("🤖 HITL PR Review Agent")
+st.caption("Human-in-the-Loop Pull Request Review system powered by LangGraph, OpenRouter, and SQLite.")
 
 
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
 with st.sidebar:
-    st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    st.header("📋 Recent Sessions")
+    sessions = asyncio.run(get_recent_sessions())
+    if sessions:
+        for s in sessions:
+            tid = s["thread_id"]
+            short_id = tid[:8]
+            risk = s.get("worst_risk", "med")
+            icon = "🔴" if risk == "high" else ("🟡" if risk == "med" else "🟢")
+            url_part = s["pr_url"].split("github.com/")[-1] if "github.com/" in s["pr_url"] else s["pr_url"]
+
+            with st.container(border=True):
+                st.markdown(f"**{icon} {url_part}**")
+                st.caption(f"Thread: `{short_id}` • Events: {s['events']}")
+                st.caption(f"Last: {str(s['last_event'])[:19]}")
+                if st.button("Load Session", key=f"btn_{tid}", use_container_width=True):
+                    st.session_state.thread_id = tid
+                    st.session_state.pr_url = s["pr_url"]
+                    st.session_state.interrupt_payload = None
+                    st.session_state.final = None
+                    st.rerun()
+    else:
+        st.info("No recorded sessions yet. Run a review to populate the audit log!")
+
+    st.divider()
+    st.markdown("### 💡 Quick Test PRs")
+    if st.button("PR #1: Task priority (58–72%)", use_container_width=True):
+        st.session_state.pr_url = "https://github.com/VinUni-AI20k/PR-Demo/pull/1"
+        st.rerun()
+    if st.button("PR #2: Login & sync (<58%)", use_container_width=True):
+        st.session_state.pr_url = "https://github.com/VinUni-AI20k/PR-Demo/pull/2"
+        st.rerun()
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
 with st.form("start"):
-    pr_url = st.text_input(
-        "PR URL", value=st.session_state.pr_url,
-        placeholder="https://github.com/VinUni-AI20k/PR-Demo/pull/1",
-    )
-    submitted = st.form_submit_button("Run review")
+    col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        pr_url = st.text_input(
+            "PR URL",
+            value=st.session_state.pr_url,
+            placeholder="https://github.com/VinUni-AI20k/PR-Demo/pull/1",
+        )
+    with col_btn:
+        st.write("")
+        st.write("")
+        submitted = st.form_submit_button("Run review", type="primary", use_container_width=True)
 
 
 # ─── Renderers per interrupt kind ──────────────────────────────────────────
 def render_approval_card(payload: dict) -> dict | None:
     """58–72% bucket: show the LLM review + 3 buttons. Return resume dict or None."""
     conf = payload["confidence"]
-    st.subheader(f"Approval requested — confidence {conf:.0%}")
-    st.caption(payload["confidence_reasoning"])
-    st.markdown(payload["summary"])
+    with st.container(border=True):
+        st.markdown(f"### ⚠️ Human Approval Requested — Confidence: **{conf:.0%}**")
+        st.progress(conf)
+        st.info(f"**Reasoning:** {payload['confidence_reasoning']}")
 
-    for c in payload.get("comments", []):
-        st.markdown(f"- **[{c['severity']}]** `{c['file']}:{c.get('line') or '?'}` — {c['body']}")
+        st.markdown("#### 📝 Summary")
+        st.markdown(payload["summary"])
 
-    with st.expander("Diff"):
-        st.code(payload.get("diff_preview", ""), language="diff")
+        comments = payload.get("comments", [])
+        if comments:
+            st.markdown(f"#### 🔍 Review Comments ({len(comments)})")
+            for c in comments:
+                sev = c.get("severity", "issue")
+                sev_icon = "🛑" if sev == "blocker" else ("⚠️" if sev == "issue" else "💡")
+                st.markdown(f"{sev_icon} **[{sev.upper()}]** `{c.get('file')}:{c.get('line') or '?'}` — {c.get('body')}")
 
-    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
-    col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
-    if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
-    if col2.button("Reject"):
-        ...
-    if col3.button("Edit"):
-        ...
+        with st.expander("📄 View Unified Diff Preview"):
+            st.code(payload.get("diff_preview", ""), language="diff")
+
+        st.markdown("---")
+        feedback = st.text_input("Reviewer Notes / Feedback (optional):", key="approval_feedback")
+
+        col1, col2, col3 = st.columns(3)
+        if col1.button("✅ Approve & Post Comment", type="primary", use_container_width=True):
+            return {"choice": "approve", "feedback": feedback}
+        if col2.button("❌ Reject Review", use_container_width=True):
+            return {"choice": "reject", "feedback": feedback}
+        if col3.button("✏️ Edit / Request Refinement", use_container_width=True):
+            return {"choice": "edit", "feedback": feedback}
+
     return None
 
 
 def render_escalation_card(payload: dict) -> dict | None:
     """< 58% bucket: show risk factors + question form. Return {question: answer} or None."""
     conf = payload["confidence"]
-    st.subheader(f"Strong escalation — confidence {conf:.0%}")
-    st.caption(payload["confidence_reasoning"])
-    if payload.get("risk_factors"):
-        st.error("Risks: " + ", ".join(payload["risk_factors"]))
-    st.markdown(payload["summary"])
+    with st.container(border=True):
+        st.error(f"### 🚨 Strong Escalation Triggered — Confidence: **{conf:.0%}**")
+        st.progress(conf)
+        st.caption(f"**Reasoning:** {payload['confidence_reasoning']}")
 
-    with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
-        answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        if payload.get("risk_factors"):
+            st.warning("**Identified Risk Factors:**\n" + "\n".join(f"- {rf}" for rf in payload["risk_factors"]))
+
+        st.markdown("#### 📝 Summary")
+        st.markdown(payload["summary"])
+
+        st.markdown("---")
+        st.markdown("#### ❓ Reviewer Clarification Required")
+        st.caption("The agent has detected significant uncertainties. Please answer the following questions to help synthesize an accurate review:")
+
+        with st.form("escalation_form"):
+            answers: dict[str, str] = {}
+            questions = payload.get("questions", [])
+            for idx, q in enumerate(questions):
+                st.markdown(f"**Q{idx + 1}: {q}**")
+                answers[q] = st.text_area(f"Your answer to Q{idx + 1}", key=f"q_input_{idx}", height=70)
+
+            submitted_ans = st.form_submit_button("📤 Submit Answers & Synthesize Review", type="primary", use_container_width=True)
+            if submitted_ans:
+                return answers
+
     return None
 
 
@@ -119,18 +199,15 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
     """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
     async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
         await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
 
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            result = await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        else:
+            result = await app.ainvoke(Command(resume=resume_value), cfg)
+
+        return result
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
@@ -140,21 +217,22 @@ if submitted and pr_url:
     st.session_state.interrupt_payload = None
     st.session_state.final = None
 
-    with st.spinner("Fetching PR + asking the LLM..."):
+    with st.spinner("Fetching PR and running LLM analysis..."):
         result = asyncio.run(run_graph(pr_url, st.session_state.thread_id))
 
     if "__interrupt__" in result:
         st.session_state.interrupt_payload = result["__interrupt__"][0].value
     else:
         st.session_state.final = result
+    st.rerun()
 
 # Render the current interrupt card, if any
 payload = st.session_state.interrupt_payload
 if payload is not None:
-    kind = payload["kind"]
+    kind = payload.get("kind")
     answer = render_approval_card(payload) if kind == "approval_request" else render_escalation_card(payload)
     if answer is not None:
-        with st.spinner("Resuming..."):
+        with st.spinner("Resuming agent with your input..."):
             result = asyncio.run(run_graph(
                 st.session_state.pr_url, st.session_state.thread_id, resume_value=answer,
             ))
@@ -169,11 +247,22 @@ if payload is not None:
 if st.session_state.final is not None:
     final = st.session_state.final
     action = final.get("final_action", "?")
-    if action.startswith("auto") or action.startswith("committed"):
-        st.success(f"✓ {action} — comment posted to {st.session_state.pr_url}")
-    elif action == "rejected":
-        st.warning("Rejected — no comment posted")
-    else:
-        st.info(f"final_action = {action}")
-    st.caption(f"thread_id = {st.session_state.thread_id}  ·  replay: "
-               f"`uv run python -m audit.replay --thread {st.session_state.thread_id}`")
+    with st.container(border=True):
+        if action.startswith("auto") or action.startswith("committed"):
+            st.balloons()
+            st.success(f"🎉 **Status:** `{action}` — Review comment successfully posted to GitHub!")
+        elif action == "rejected":
+            st.warning(f"⚠️ **Status:** `rejected` — Review rejected by human reviewer. No comments posted.")
+        else:
+            st.info(f"ℹ️ **Status:** `final_action = {action}`")
+
+        if "analysis" in final:
+            a = final["analysis"]
+            st.markdown(f"**Final Confidence:** `{a.confidence:.0%}`")
+            st.markdown(f"**Summary:** {a.summary}")
+
+        st.markdown(f"🔗 [Open Pull Request on GitHub]({st.session_state.pr_url})")
+        st.caption(
+            f"Session Thread ID: `{st.session_state.thread_id}`  •  "
+            f"Replay command: `uv run python -m audit.replay --thread {st.session_state.thread_id}`"
+        )
